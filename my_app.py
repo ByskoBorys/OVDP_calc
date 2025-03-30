@@ -77,5 +77,5 @@ if st.button("Рассчитать цену"):
 
 '''
 
-with open("app.py", "w") as f:
+with open("my_app.py", "w") as f:
     f.write(code)
