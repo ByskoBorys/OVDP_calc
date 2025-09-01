@@ -4,4 +4,4 @@ numpy==1.26.4
 scipy==1.13.1
 requests==2.32.3
 xlrd==2.0.1        # для .xls НБУ
-openpyxl==3.1.2    # якщо захочеш зберігати в .xlsx
+openpyxl==3.1.2    
