@@ -1,7 +1,43 @@
 import pandas as pd
 import numpy as np
 from datetime import timedelta
-from scipy.optimize import brentq
+
+# ---------- Невибагливий солвер кореня (без SciPy) ----------
+def _bracket(func, lo=-0.99, hi=5.0, expand=1.5, max_tries=25):
+    """Шукає інтервал [lo, hi] зі зміною знаку."""
+    f_lo = func(lo)
+    f_hi = func(hi)
+    tries = 0
+    while f_lo * f_hi > 0 and tries < max_tries:
+        hi *= expand
+        f_hi = func(hi)
+        tries += 1
+    return lo, hi, f_lo, f_hi
+
+def _bisect(func, lo, hi, f_lo=None, f_hi=None, tol=1e-12, maxiter=200):
+    """Бісекція (гарантовано збіжна при зміні знаку)."""
+    if f_lo is None: f_lo = func(lo)
+    if f_hi is None: f_hi = func(hi)
+    if f_lo == 0: return lo
+    if f_hi == 0: return hi
+    for _ in range(maxiter):
+        mid = 0.5 * (lo + hi)
+        f_mid = func(mid)
+        if abs(f_mid) < tol or (hi - lo) < tol:
+            return mid
+        if f_lo * f_mid < 0:
+            hi, f_hi = mid, f_mid
+        else:
+            lo, f_lo = mid, f_mid
+    return 0.5 * (lo + hi)
+
+def _solve_root(func, lo=-0.99, hi=5.0, tol=1e-12, maxiter=200):
+    """Комбо: спершу бранкуємо інтервал, потім бісекція. Без SciPy."""
+    lo, hi, f_lo, f_hi = _bracket(func, lo, hi)
+    # якщо все ще немає зміни знаку — повернемо середину (fallback)
+    if f_lo * f_hi > 0:
+        return 0.5 * (lo + hi)
+    return _bisect(func, lo, hi, f_lo, f_hi, tol, maxiter)
 
 # ================== ХЕЛПЕРИ КУПОНІВ / ПАРАМЕТРІВ ==================
 
@@ -242,7 +278,7 @@ def yields_from_price(calc_date, isin, price_dirty, df):
                 break
             hi *= 1.5
         try:
-            y_root = brentq(pv_diff_y, lo, hi, maxiter=200, xtol=1e-12)
+            y_root = _solve_root(pv_diff_y, lo, hi, maxiter=200, xtol=1e-12)
             sec_y, sec_f = round(y_root * 100.0, 2), "YTM"
         except Exception:
             y_f = ((par + SD) / price_dirty - 1.0) * (365.0 / days_to_mty) * 100.0
@@ -277,7 +313,7 @@ def yields_from_price(calc_date, isin, price_dirty, df):
             break
         hi *= 1.5
     try:
-        y_root_mf = brentq(pv_diff_minfin, lo, hi, maxiter=200, xtol=1e-12)
+        y_root_mf = _solve_root(pv_diff_minfin, lo, hi, maxiter=200, xtol=1e-12)
         prim_y, prim_f = round(y_root_mf * 100.0, 2), "MinFin"
     except Exception:
         y_f = ((par + SD) / price_dirty - 1.0) * (365.0 / days_to_mty) * 100.0
