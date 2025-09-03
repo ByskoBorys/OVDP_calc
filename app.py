@@ -1,3 +1,28 @@
+import sys, platform, os
+
+import streamlit as st
+st.set_page_config(page_title="ОВДП калькулятор", layout="wide")
+
+st.write("✅ Boot checkpoint A: Streamlit imported")
+st.caption(f"Python {sys.version.split()[0]} on {platform.platform()}")
+st.caption(f"Working dir: {os.getcwd()}")
+
+try:
+    import pandas as pd
+    from data_loader import load_df
+    from bond_utils import (
+        secondary_price_from_yield,
+        primary_price_from_yield_minfin,
+        yields_from_price,
+        build_cashflow_schedule,
+        trade_outcome
+    )
+    st.write("✅ Boot checkpoint B: modules imported")
+except Exception as e:
+    st.error(f"❌ Import error: {e}")
+    st.stop()
+
+
 import streamlit as st
 import pandas as pd
 from datetime import date
