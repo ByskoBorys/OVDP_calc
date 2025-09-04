@@ -4,19 +4,21 @@ import pandas as pd
 import requests
 import streamlit as st
 
-URL_XLS = "https://bank.gov.ua/files/Fair_value/sec_hdbk.xls"   # web: .xls
+# Web-джерело НБУ (XLS)
+URL_XLS = "https://bank.gov.ua/files/Fair_value/sec_hdbk.xls"
+
+# Локальні фоллбеки (в такому порядку)
 FALLBACK_PATHS = [
-    Path("data/sec.hdbk-2.xls"),        # как просил
-    Path("data/sec_hdbk_sample.xlsx"),  # запасной вариант
-    Path("data/sec_hdbk_sample.csv"),   # ещё один запасной
+    Path("data/sec.hdbk-2.xls"),        # як ти просив
+    Path("data/sec_hdbk_sample.xlsx"),  # запасний варіант (xlsx)
+    Path("data/sec_hdbk_sample.csv"),   # ще один запасний (csv)
 ]
 
-# ---- вспомогалки ------------------------------------------------------------
+# ----------------------- ВСПОМОГАТЕЛЬНЫЕ -----------------------
 
 def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Находит «похожие» колонки и переименовывает в канонические имена.
-    Срабатывает на вариантах из НБУ с разными подписями.
+    Приводим «плавающие» названия к канону, типизируем, страхуемся по Par_value=1000.
     """
     def pick(cols, keys):
         for c in cols:
@@ -27,8 +29,8 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
         return None
 
     cols = list(df.columns)
-
     mapping = {}
+
     # ISIN
     c = pick(cols, ["isin"])
     if c: mapping[c] = "ISIN"
@@ -57,14 +59,13 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     c = pick(cols, ["тип інструмент", "тип инструмента", "instrument"])
     if c: mapping[c] = "Instrument_type"
 
-    # Weighted yield at placement (MinFin)
+    # Weighted yield at placement (MinFin nominal)
     c = pick(cols, ["середньозважена", "средневзвешенная", "yield_nominal", "розміщення", "размещения"])
     if c: mapping[c] = "Yield_nominal"
 
     if mapping:
         df = df.rename(columns=mapping)
 
-    # Оставляем только полезные (если они есть)
     keep = [c for c in [
         "ISIN","Par_value","Coupon_per_year","Coupon_rate","Yield_nominal",
         "Date_Issue","Date_maturity","Currency","Instrument_type"
@@ -72,7 +73,6 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     if keep:
         df = df[keep].copy()
 
-    # Типизация
     for col in ["Par_value", "Coupon_per_year", "Coupon_rate", "Yield_nominal"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -81,11 +81,10 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Если Par_value отсутствует или пустой — подставим 1000 (ОВДП стандарт)
+    # якщо Par_value немає/порожній — підставляємо 1000
     if "Par_value" not in df.columns or df["Par_value"].isna().all():
         df["Par_value"] = 1000
 
-    # Фильтрация ISIN
     if "ISIN" in df.columns:
         df = df[df["ISIN"].notna()].drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
 
@@ -94,7 +93,7 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
 
 def _parse_web_xls(content: bytes) -> pd.DataFrame:
     raw = io.BytesIO(content)
-    # сначала «сырой» проход для поиска строки-заголовка
+    # «черновой» проход, чтобы найти строку шапки
     df_raw = pd.read_excel(raw, header=None, engine="xlrd")
     header_row = None
     for i in range(min(30, len(df_raw))):
@@ -102,16 +101,14 @@ def _parse_web_xls(content: bytes) -> pd.DataFrame:
         if any(x.strip().upper() == "ISIN" for x in row):
             header_row = i
             break
+
+    raw.seek(0)
     if header_row is None:
-        # если не нашли «шапку» — читаем как есть и будем угадывать названия
-        raw.seek(0)
         df = pd.read_excel(raw, engine="xlrd")
     else:
-        raw.seek(0)
         df = pd.read_excel(raw, header=header_row, engine="xlrd")
 
-    df = _guess_and_rename(df)
-    return df
+    return _guess_and_rename(df)
 
 
 def _read_local(path: Path) -> pd.DataFrame:
@@ -124,27 +121,25 @@ def _read_local(path: Path) -> pd.DataFrame:
         return _guess_and_rename(pd.read_csv(path))
     raise ValueError(f"Неподдерживаемый формат фоллбека: {path}")
 
-
-# ---- публичная функция ------------------------------------------------------
+# ----------------------- ПУБЛИЧНАЯ ФУНКЦИЯ -----------------------
 
 @st.cache_data(ttl=86400)
 def load_df():
     """
-    Возврат: (df, asof_label)
-    asof_label — строка для UI, всегда не 'NaT' (дата успешной загрузки: web или локальный).
+    Возвращает: (df, asof_label)
+    asof_label — строка для UI (дата успешной загрузки: web или локальный).
     """
-    # 1) Пробуем web
+    # 1) web
     try:
         r = requests.get(URL_XLS, timeout=30)
         r.raise_for_status()
         df = _parse_web_xls(r.content)
-        # если после нормализации нет нужных полей — это уже наш df, Par_value гарантируется
-        asof_label = str(pd.Timestamp.now().date())  # дата успешной загрузки
+        asof_label = str(pd.Timestamp.now().date())          # дата УСПЕШНОГО скачивания
         return df, asof_label
     except Exception as e_web:
         st.warning(f"НБУ недоступен або формат змінився: {e_web}. Використовую локальний файл.", icon="⚠️")
 
-    # 2) Фоллбеки
+    # 2) локальные фоллбеки
     for p in FALLBACK_PATHS:
         if p.exists():
             try:
@@ -154,7 +149,7 @@ def load_df():
             except Exception as e_loc:
                 st.warning(f"Не вдалося прочитати {p.name}: {e_loc}")
 
-    # 3) Совсем плохо
+    # 3) вообще ничего нет
     raise FileNotFoundError(
         f"Немає жодного файлу фоллбека: {', '.join(str(p) for p in FALLBACK_PATHS)}"
     )
