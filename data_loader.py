@@ -1,264 +1,160 @@
 import io
 from pathlib import Path
-import pandas as pd
-import numpy as np
+import re
 import requests
+import pandas as pd
 import streamlit as st
 
+# ---- источники ----
 URL_XLS = "https://bank.gov.ua/files/Fair_value/sec_hdbk.xls"
-
-FALLBACK_PATHS = [
+FALLBACKS = [
     Path("data/sec.hdbk-2.xls"),
     Path("data/sec_hdbk_sample.xlsx"),
     Path("data/sec_hdbk_sample.csv"),
 ]
 
-# ----------------------- helpers -----------------------
+# ---- утилиты ----
+def _clean_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str)
+         .str.replace("\u00A0", "", regex=False)  # nbsp
+         .str.replace(" ", "", regex=False)
+         .str.replace(",", ".", regex=False)
+         .str.replace("%", "", regex=False)
+         .str.strip(),
+        errors="coerce"
+    )
 
-def _clean_percent_series(s: pd.Series) -> pd.Series:
-    if s is None:
-        return pd.Series(dtype=float)
-    s2 = s.astype(str).str.replace("%", "", regex=False).str.replace(",", ".", regex=False).str.strip()
-    s_num = pd.to_numeric(s2, errors="coerce")
-    if s_num.dropna().median() > 1.0:
-        s_num = s_num / 100.0
-    return s_num
-
-def _find_header_row(df_raw: pd.DataFrame) -> int | None:
-    for i in range(min(40, len(df_raw))):
-        row = df_raw.iloc[i].astype(str).str.strip().str.lower().tolist()
-        if any(x == "isin" for x in row):
-            return i
-    return None
-
-def _rename_initial(df: pd.DataFrame) -> pd.DataFrame:
-    """Початкове маппінг-ренейм найтиповіших назв у канон."""
-    mapping = {}
-    lowmap = {c: str(c).lower() for c in df.columns}
-
-    def find(*keys):
-        for c, low in lowmap.items():
-            if all(k in low for k in keys):
-                return c
-        return None
-
-    m = find("isin");                            mapping[m] = "ISIN"                       if m else None
-    m = find("валют", "випуск") or find("currency"); mapping[m] = "Currency"               if m else None
-    m = find("дата", "випуск") or find("issue"); mapping[m] = "Date_Issue"                 if m else None
-    m = find("номінальн", "варт") or find("par"); mapping[m] = "Par_value"                 if m else None
-    m = find("кількість", "купон") or find("количество", "купон"); mapping[m] = "Coupon_per_year" if m else None
-    m = find("дата", "погаш") or find("maturity"); mapping[m] = "Date_maturity"            if m else None
-    m = find("тип", "виплат") or find("тип", "выплат"); mapping[m] = "Payment_type"        if m else None
-    # Колонка I: «Номінальний рівень дохідності, %»
-    # частіше за все містить слова 'номінальн' і 'дохідн' і '%'
-    m = find("номінальн", "дохідн") or find("номинал", "доход"); mapping[m] = "Yield_nominal" if m else None
-
-    # застосувати тільки знайдені ключі
-    mapping = {k: v for k, v in mapping.items() if k is not None}
-    return df.rename(columns=mapping) if mapping else df
-
-def _detect_coupon_amount_column(df: pd.DataFrame) -> str | None:
+def _parse_table_like_in_spec(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     """
-    Знайти колонку «сума купонного платежу на 1 облігацію».
-    Логіка: серед числових/квазі-числових колонок шукаємо ту, де:
-      - на рядках Payment_type ~ 'купон' медіана > 0
-      - на рядках Payment_type ~ 'погаш' медіана близька до 0
+    Реализация ровно по твоему алгоритму:
+      - дата актуальности = A2 + ' ' + B2  (берём последним словом из склейки)
+      - режем первые 4 строки
+      - оставляем колонки A..I + последний столбец
+      - переименовываем как в примере
+      - дропаем лишнее, первую строку, приводим типы
+    Возвращает: (нормализованный df, asof_label_str)
     """
-    if "Payment_type" not in df.columns:
-        return None
+    # 1) Дата актуальности
+    date_actuality = "Не вдалося визначити дату"
+    try:
+        a2 = df.iloc[1, 0]
+        b2 = df.iloc[1, 1]
+        if isinstance(a2, str) and isinstance(b2, str):
+            date_text = f"{a2} {b2}"
+            # возьмем последний токен, но если это не дата — поищем шаблон dd.mm.yyyy
+            token = date_text.split()[-1]
+            m = re.search(r"(\d{2}\.\d{2}\.\d{4})", date_text)
+            date_actuality = m.group(1) if m else token
+    except Exception:
+        pass
 
-    # перетворимо усі неканонічні колонки у numeric-кандидати
-    canonical = {
-        "ISIN","Currency","Date_Issue","Par_value","Coupon_per_year",
-        "Date_maturity","Payment_type","Yield_nominal"
-    }
-    candidates = []
-    pt = df["Payment_type"].astype(str).str.lower()
-    mask_coupon = pt.str.contains("купон", na=False)
-    mask_redemp = pt.str.contains("погаш", na=False)
+    # 2) срез строк
+    df = df.iloc[4:].reset_index(drop=True)
 
-    for c in df.columns:
-        if c in canonical:
-            continue
-        series = pd.to_numeric(
-            df[c].astype(str).str.replace(",", ".", regex=False).str.replace("%", "", regex=False),
-            errors="coerce"
-        )
-        if series.notna().sum() < max(3, int(0.05 * len(series))):
-            continue
-        med_coupon = series[mask_coupon].median(skipna=True)
-        med_redem  = series[mask_redemp].median(skipna=True)
-        if pd.notna(med_coupon) and med_coupon > 0 and (pd.isna(med_redem) or abs(med_redem) < 1e-6):
-            candidates.append((c, med_coupon, med_redem))
+    # 3) колонки: A..I (0..8) + последний (-1)
+    keep_idx = list(range(9)) + [-1]
+    # на всякий случай, если столбцов меньше
+    keep_idx = [i for i in keep_idx if -len(df.columns) <= i < len(df.columns)]
+    df = df.iloc[:, keep_idx]
 
-    # оберемо найбільш «виразну» колонку (найбільша медіана на купонах)
-    if candidates:
-        candidates.sort(key=lambda x: x[1], reverse=True)
-        return candidates[0][0]
-    return None
+    # 4) переименование 1-в-1 как у тебя
+    new_cols = ["ISIN", "Type", "Currency", "Date_Issue", "Par_value",
+                "Coupon_per_year", "Date_maturity", "Drop",
+                "Yield_nominal", "qnt"]
+    df.columns = new_cols[:len(df.columns)]
 
-def _aggregate_to_bond_directory(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    З редукованої «подієвої» таблиці (купонні/погашення) робимо 1 рядок на ISIN.
-    Рахуємо Coupon_rate як (coupon_amount_per_payment * freq)/Par.
-    """
-    coupon_col = _detect_coupon_amount_column(df)
-    # приведемо типи
+    # 5) выкинем H ("Drop")
+    if "Drop" in df.columns:
+        df = df.drop(columns=["Drop"], errors="ignore")
+
+    # 6) удалить строку 0 (повтор заголовков)
+    if not df.empty:
+        df = df.drop(index=0, errors="ignore").reset_index(drop=True)
+
+    # 7) типизация (ровно по смыслу твоих комментариев)
+    if "Date_Issue" in df.columns:
+        df["Date_Issue"] = pd.to_datetime(df["Date_Issue"], dayfirst=True, errors="coerce")
+    if "Date_maturity" in df.columns:
+        df["Date_maturity"] = pd.to_datetime(df["Date_maturity"], dayfirst=True, errors="coerce")
+
     if "Par_value" in df.columns:
-        df["Par_value"] = pd.to_numeric(df["Par_value"], errors="coerce")
+        df["Par_value"] = _clean_num(df["Par_value"]).fillna(1000.0)
+
     if "Coupon_per_year" in df.columns:
-        df["Coupon_per_year"] = pd.to_numeric(df["Coupon_per_year"], errors="coerce")
+        df["Coupon_per_year"] = _clean_num(df["Coupon_per_year"]).fillna(2).astype("Int64")
+        df["Coupon_per_year"] = df["Coupon_per_year"].clip(lower=1)
+
     if "Yield_nominal" in df.columns:
-        df["Yield_nominal"] = _clean_percent_series(df["Yield_nominal"])
-    for col in ["Date_Issue","Date_maturity"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+        # в файле это проценты → переводим в десятичную долю
+        df["Yield_nominal"] = _clean_num(df["Yield_nominal"]) / 100.0
 
-    # Вибір «купонних» рядків
-    coupon_rows = pd.Series(False, index=df.index)
-    if "Payment_type" in df.columns:
-        coupon_rows = df["Payment_type"].astype(str).str.lower().str.contains("купон", na=False)
+    # 8) один ряд на ISIN
+    if "ISIN" in df.columns:
+        df = df[df["ISIN"].notna()].drop_duplicates(subset=["ISIN"], keep="first").reset_index(drop=True)
 
-    if coupon_col is not None:
-        coupon_amount = pd.to_numeric(
-            df[coupon_col].astype(str).str.replace(",", ".", regex=False),
-            errors="coerce"
-        )
+    # Дополнительные удобные поля для расчётов:
+    # — Coupon_rate: используем номинальную доходность как купонную ставку (твоя логика)
+    if "Yield_nominal" in df.columns and "Par_value" in df.columns:
+        df["Coupon_rate"] = df["Yield_nominal"].fillna(0.0)  # десятичная ставка
+
+    # Дефолты
+    if "Currency" in df.columns:
+        df["Currency"] = df["Currency"].fillna("UAH")
     else:
-        coupon_amount = pd.Series(np.nan, index=df.index)
+        df["Currency"] = "UAH"
 
-    # групування
-    groups = []
-    for isin, g in df.groupby("ISIN"):
-        if pd.isna(isin):
-            continue
-        row = {}
-        row["ISIN"] = isin
-        row["Currency"] = g["Currency"].dropna().iloc[0] if "Currency" in g.columns and g["Currency"].notna().any() else "UAH"
-        row["Par_value"] = float(g["Par_value"].dropna().iloc[0]) if "Par_value" in g.columns and g["Par_value"].notna().any() else 1000.0
-        row["Coupon_per_year"] = int(g["Coupon_per_year"].dropna().iloc[0]) if "Coupon_per_year" in g.columns and g["Coupon_per_year"].notna().any() else 2
-        row["Date_Issue"] = g["Date_Issue"].dropna().min() if "Date_Issue" in g.columns else pd.NaT
-        row["Date_maturity"] = g["Date_maturity"].dropna().max() if "Date_maturity" in g.columns else pd.NaT
-        row["Instrument_type"] = g["Instrument_type"].dropna().iloc[0] if "Instrument_type" in g.columns and g["Instrument_type"].notna().any() else None
-        row["Yield_nominal"] = float(g["Yield_nominal"].dropna().iloc[0]) if "Yield_nominal" in g.columns and g["Yield_nominal"].notna().any() else np.nan
+    return df, date_actuality
 
-        # купонна сума (на 1 облігацію) з рядків «купонний платіж»
-        if coupon_col is not None and "Payment_type" in g.columns:
-            gc = g.copy()
-            mask_c = gc["Payment_type"].astype(str).str.lower().str.contains("купон", na=False)
-            if mask_c.any():
-                amt = pd.to_numeric(
-                    gc.loc[mask_c, coupon_col].astype(str).str.replace(",", ".", regex=False),
-                    errors="coerce"
-                ).dropna()
-                coupon_amt = float(amt.iloc[0]) if len(amt) else 0.0
-            else:
-                coupon_amt = 0.0
-        else:
-            coupon_amt = 0.0
-
-        # ставка купона (десяткова), страхуємося від ділення на нуль
-        if row["Par_value"] and row["Coupon_per_year"] and coupon_amt:
-            row["Coupon_rate"] = (coupon_amt * row["Coupon_per_year"]) / row["Par_value"]
-        else:
-            row["Coupon_rate"] = 0.0
-
-        # Якщо Date_Issue порожня — підставимо Maturity − 365 днів
-        if pd.isna(row["Date_Issue"]) and pd.notna(row["Date_maturity"]):
-            row["Date_Issue"] = row["Date_maturity"] - pd.to_timedelta(365, unit="D")
-
-        groups.append(row)
-
-    out = pd.DataFrame(groups)
-
-    # Фінальна типізація/дефолти
-    if "Par_value" in out.columns:
-        out["Par_value"] = pd.to_numeric(out["Par_value"], errors="coerce").fillna(1000.0)
-    if "Coupon_per_year" in out.columns:
-        out["Coupon_per_year"] = pd.to_numeric(out["Coupon_per_year"], errors="coerce").fillna(2).clip(lower=1).astype(int)
-    if "Coupon_rate" in out.columns:
-        out["Coupon_rate"] = pd.to_numeric(out["Coupon_rate"], errors="coerce").fillna(0.0)
-    if "Yield_nominal" in out.columns:
-        out["Yield_nominal"] = pd.to_numeric(out["Yield_nominal"], errors="coerce")
-
-    for col in ["Date_Issue","Date_maturity"]:
-        if col in out.columns:
-            out[col] = pd.to_datetime(out[col], errors="coerce")
-
-    # Забезпечимо наявність мінімального набору колонок
-    for col, default in [
-        ("Currency","UAH"),
-        ("Instrument_type", None),
-        ("Coupon_rate", 0.0),
-        ("Yield_nominal", np.nan),
-    ]:
-        if col not in out.columns:
-            out[col] = default
-
-    out = out[out["ISIN"].notna()].drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
-    return out
-
-def _parse_web_xls(content: bytes) -> pd.DataFrame:
+def _read_xls_bytes_like_spec(content: bytes) -> tuple[pd.DataFrame, str]:
     raw = io.BytesIO(content)
     df_raw = pd.read_excel(raw, header=None, engine="xlrd")
-    header_row = _find_header_row(df_raw)
+    return _parse_table_like_in_spec(df_raw)
 
-    raw.seek(0)
-    df = pd.read_excel(raw, engine="xlrd") if header_row is None else pd.read_excel(raw, header=header_row, engine="xlrd")
-    df = _rename_initial(df)     # дає нам ISIN / Currency / Par_value / Coupon_per_year / Date_* / Payment_type / Yield_nominal
-    df = _aggregate_to_bond_directory(df)
-    return df
-
-def _read_local(path: Path) -> pd.DataFrame:
+def _read_local_file_like_spec(path: Path) -> tuple[pd.DataFrame, str]:
     ext = path.suffix.lower()
     if ext == ".xls":
-        df = pd.read_excel(path, engine="xlrd")
+        df_raw = pd.read_excel(path, header=None, engine="xlrd")
     elif ext == ".xlsx":
-        df = pd.read_excel(path, engine="openpyxl")
+        df_raw = pd.read_excel(path, header=None, engine="openpyxl")
     elif ext == ".csv":
-        df = pd.read_csv(path)
+        # попробуем эмулировать структуру: csv без заголовка
+        df_raw = pd.read_csv(path, header=None)
     else:
-        raise ValueError(f"Непідтримуваний формат фоллбека: {path}")
+        raise ValueError(f"Непідтримуваний формат: {path}")
+    return _parse_table_like_in_spec(df_raw)
 
-    df = _rename_initial(df)
-    df = _aggregate_to_bond_directory(df)
-    return df
-
-# ----------------------- public -----------------------
-
+# ---- публичная функция ----
 @st.cache_data(ttl=86400)
 def load_df():
     """
-    Повертає: (df, asof_label)
-    df — по ОДНОМУ рядку на ISIN зі стовпцями:
-        ISIN, Currency, Par_value, Coupon_per_year, Coupon_rate (десяткова),
-        Date_Issue, Date_maturity, Instrument_type, Yield_nominal (десяткова)
-    asof_label — дата успішного завантаження (рядок для UI).
+    Возвращает (df, asof_label):
+      df — по одному ряду на ISIN со столбцами: ISIN, Type, Currency, Date_Issue,
+            Par_value, Coupon_per_year, Date_maturity, Yield_nominal (доля),
+            qnt, Coupon_rate (доля)
+      asof_label — дата актуальности из A2+B2 (если не вышло — дата удачной загрузки).
     """
     # 1) web
     try:
         r = requests.get(URL_XLS, timeout=30)
         r.raise_for_status()
-        df = _parse_web_xls(r.content)
-        asof_label = str(pd.Timestamp.now().date())
-        if df["Date_maturity"].isna().all():
-            raise ValueError("У джерелі НБУ відсутня коректна дата погашення.")
-        return df, asof_label
+        df, asof = _read_xls_bytes_like_spec(r.content)
+        # если дату не удалось вытащить из файла — ставим дату успешного скачивания
+        if not asof or "не вдал" in asof.lower():
+            asof = str(pd.Timestamp.now().date())
+        return df, asof
     except Exception as e_web:
         st.warning(f"НБУ недоступен або формат змінився: {e_web}. Використовую локальний файл.", icon="⚠️")
 
     # 2) fallbacks
-    for p in FALLBACK_PATHS:
+    for p in FALLBACKS:
         if p.exists():
             try:
-                df = _read_local(p)
-                if df["Date_maturity"].isna().all():
-                    raise ValueError("У фоллбек-файлі немає коректної дати погашення.")
-                asof_label = f"локальний файл • {pd.Timestamp.now().date()}"
-                return df, asof_label
+                df, asof = _read_local_file_like_spec(p)
+                if not asof or "не вдал" in asof.lower():
+                    asof = f"локальний файл • {pd.Timestamp.now().date()}"
+                return df, asof
             except Exception as e_loc:
                 st.warning(f"Не вдалося прочитати {p.name}: {e_loc}")
 
-    raise FileNotFoundError(
-        f"Немає жодного файлу фоллбека: {', '.join(str(p) for p in FALLBACK_PATHS)}"
-    )
+    raise FileNotFoundError(f"Немає жодного файлу фоллбека: {', '.join(str(p) for p in FALLBACKS)}")
