@@ -1,10 +1,23 @@
 import pandas as pd
 import numpy as np
-from datetime import timedelta
 
 DAY_COUNT = 365.0  # ACT/365
 
 # ----------------------------- Utils -----------------------------
+def _norm_pct_scalar(v) -> float:
+    """Нормалізує значення у десятковий відсоток (0.16)."""
+    if v is None or (isinstance(v, float) and (pd.isna(v))):
+        return 0.0
+    try:
+        if isinstance(v, str):
+            s = v.replace("%", "").replace(",", ".").strip()
+            x = float(s)
+        else:
+            x = float(v)
+    except Exception:
+        return 0.0
+    return x / 100.0 if x > 1.0 else x
+
 def _get_bond_row(df: pd.DataFrame, isin: str) -> pd.Series:
     if "ISIN" not in df.columns:
         raise KeyError("В довіднику немає колонки 'ISIN'.")
@@ -15,8 +28,16 @@ def _get_bond_row(df: pd.DataFrame, isin: str) -> pd.Series:
 
     # Normalize required fields with defaults
     row["Par_value"] = float(row.get("Par_value", 1000) if pd.notna(row.get("Par_value", np.nan)) else 1000)
-    row["Coupon_per_year"] = int(row.get("Coupon_per_year", 0) if pd.notna(row.get("Coupon_per_year", np.nan)) else 0)
-    row["Coupon_rate"] = float(row.get("Coupon_rate", 0.0) if pd.notna(row.get("Coupon_rate", np.nan)) else 0.0)
+    # купон у десятковому вигляді
+    row["Coupon_rate"] = _norm_pct_scalar(row.get("Coupon_rate", 0.0))
+    # частота
+    cpy = row.get("Coupon_per_year", 2)
+    try:
+        cpy = int(cpy) if pd.notna(cpy) else 2
+    except Exception:
+        cpy = 2
+    row["Coupon_per_year"] = max(0, cpy)
+
     row["Currency"] = str(row.get("Currency", "UAH")) if pd.notna(row.get("Currency", np.nan)) else "UAH"
 
     # Dates
@@ -34,8 +55,7 @@ def _get_bond_row(df: pd.DataFrame, isin: str) -> pd.Series:
 def _generate_coupon_dates(issue: pd.Timestamp, maturity: pd.Timestamp, freq: int) -> list:
     if freq is None or freq <= 0:
         return [maturity]
-    # Генеруємо дати від погашення назад з кроком у місяцях 12/freq
-    months = int(round(12/freq))
+    months = int(round(12 / freq))
     dates = [maturity]
     d = maturity
     for _ in range(50):  # safety
@@ -43,18 +63,17 @@ def _generate_coupon_dates(issue: pd.Timestamp, maturity: pd.Timestamp, freq: in
         dates.append(d.normalize())
         if d <= issue - pd.DateOffset(days=1):
             break
-    dates = sorted(list(set(dates)))
-    # Відфільтруємо дати раніше за issue + невеликий запас
+    dates = sorted(set(dates))
     dates = [x for x in dates if x >= issue]
     if dates[-1] != maturity:
         dates.append(maturity)
-        dates = sorted(list(set(dates)))
+        dates = sorted(set(dates))
     return dates
 
 def _coupon_amount(par: float, coupon_rate: float, freq: int) -> float:
     if freq is None or freq <= 0 or coupon_rate == 0:
         return 0.0
-    return par * (coupon_rate) / float(freq)
+    return par * coupon_rate / float(freq)
 
 def _accrued_interest(calc_date: pd.Timestamp, last_coupon: pd.Timestamp, next_coupon: pd.Timestamp, coupon_amt: float) -> float:
     if coupon_amt == 0.0:
@@ -84,13 +103,13 @@ def build_cashflow_schedule(df: pd.DataFrame, isin: str, from_date: str):
     freq = int(row["Coupon_per_year"])
     par = float(row["Par_value"])
     ccy = row["Currency"]
-    coupon_rate = float(row["Coupon_rate"])  # decimal, e.g., 0.16
+    coupon_rate = float(row["Coupon_rate"])  # decimal (0.16)
 
     coupons = _generate_coupon_dates(issue, maturity, freq)
     from_dt = pd.to_datetime(from_date).normalize()
     coupon_amt = _coupon_amount(par, coupon_rate, freq)
     cfs = _future_cashflows(from_dt, coupons, coupon_amt, par)
-    sched = pd.DataFrame([(d.strftime("%Y-%m-%d"), round(a, 8)) for d,a in cfs], columns=["Дата", "Сума"])
+    sched = pd.DataFrame([(d.strftime("%Y-%m-%d"), round(a, 8)) for d, a in cfs], columns=["Дата", "Сума"])
     return sched, coupon_rate, ccy
 
 # --------------------------- Pricing -----------------------------
@@ -99,7 +118,6 @@ def _sim_price(calc_date: pd.Timestamp, redemption_date: pd.Timestamp, redemptio
     return redemption_amt / (1.0 + y * (days / DAY_COUNT))
 
 def _ytm_dirty(calc_date: pd.Timestamp, cfs: list, y: float) -> float:
-    # y is effective annual (decimal), discount continuously by (1+y)^{t}
     dirty = 0.0
     for d, amt in cfs:
         t = (d - calc_date).days / DAY_COUNT
@@ -107,7 +125,6 @@ def _ytm_dirty(calc_date: pd.Timestamp, cfs: list, y: float) -> float:
     return dirty
 
 def _minfin_dirty(calc_date: pd.Timestamp, cfs: list, y: float) -> float:
-    # Simple interest discounting each cashflow: CF / (1 + y * t)
     dirty = 0.0
     for d, amt in cfs:
         t = (d - calc_date).days / DAY_COUNT
@@ -115,29 +132,21 @@ def _minfin_dirty(calc_date: pd.Timestamp, cfs: list, y: float) -> float:
     return dirty
 
 def secondary_price_from_yield(calc_date: str, isin: str, yield_percent: float, df: pd.DataFrame):
-    """
-    Вторинний ринок:
-      - Якщо купон 0 або залишився останній купон -> формула СІМ.
-      - Інакше -> YTM (ефективна ставка, дисконтуємо (1+y)^t).
-    Повертаємо: dirty, AI, clean, ccy, formula_label
-    """
     row = _get_bond_row(df, isin)
     calc = pd.to_datetime(calc_date).normalize()
     par = float(row["Par_value"])
     freq = int(row["Coupon_per_year"])
-    coupon_rate = float(row["Coupon_rate"])
+    coupon_rate = float(row["Coupon_rate"])  # decimal
     ccy = row["Currency"]
     maturity = row["Date_maturity"]
     issue = row["Date_Issue"]
 
     coupons = _generate_coupon_dates(issue, maturity, freq)
     coupon_amt = _coupon_amount(par, coupon_rate, freq)
-    # last and next coupons for AI
     last_coupon = max([d for d in coupons if d <= calc] or [issue])
     next_coupon = min([d for d in coupons if d > calc] or [maturity])
 
     y = float(yield_percent) / 100.0
-    # decide SIM or YTM
     remain_coupons = sum(1 for d in coupons if d > calc)
     if coupon_amt == 0.0 or remain_coupons <= 1:
         redemption = par + (coupon_amt if coupon_amt > 0 else 0.0)
@@ -153,11 +162,6 @@ def secondary_price_from_yield(calc_date: str, isin: str, yield_percent: float, 
     return round(dirty, 2), round(ai, 2), round(clean, 2), ccy, formula
 
 def primary_price_from_yield_minfin(calc_date: str, isin: str, yield_percent: float, df: pd.DataFrame):
-    """
-    Первинний ринок:
-      - Дисконтні -> SIM
-      - Купонні -> Мінфін: просте дисконтування кожного грошового потоку (1 + y * t)
-    """
     row = _get_bond_row(df, isin)
     calc = pd.to_datetime(calc_date).normalize()
     par = float(row["Par_value"])
@@ -188,14 +192,10 @@ def primary_price_from_yield_minfin(calc_date: str, isin: str, yield_percent: fl
 
 # ------------------------ Yield from price -----------------------
 def _solve_bisect(func, lo, hi, tol=1e-8, max_iter=200):
-    f_lo = func(lo)
-    f_hi = func(hi)
-    if f_lo == 0:
-        return lo
-    if f_hi == 0:
-        return hi
+    f_lo = func(lo); f_hi = func(hi)
+    if f_lo == 0: return lo
+    if f_hi == 0: return hi
     if f_lo * f_hi > 0:
-        # expand range
         for _ in range(30):
             hi *= 1.5
             f_hi = func(hi)
@@ -207,20 +207,12 @@ def _solve_bisect(func, lo, hi, tol=1e-8, max_iter=200):
         if abs(f_mid) < tol:
             return mid
         if f_lo * f_mid <= 0:
-            hi = mid
-            f_hi = f_mid
+            hi, f_hi = mid, f_mid
         else:
-            lo = mid
-            f_lo = f_mid
+            lo, f_lo = mid, f_mid
     return 0.5 * (lo + hi)
 
 def yields_from_price(calc_date: str, isin: str, price_dirty: float, df: pd.DataFrame):
-    """
-    Повертає словник:
-      - Currency
-      - Secondary_yield, Secondary_formula
-      - Primary_yield, Primary_formula
-    """
     row = _get_bond_row(df, isin)
     calc = pd.to_datetime(calc_date).normalize()
     par = float(row["Par_value"])
@@ -234,25 +226,21 @@ def yields_from_price(calc_date: str, isin: str, price_dirty: float, df: pd.Data
     coupon_amt = _coupon_amount(par, coupon_rate, freq)
     last_coupon = max([d for d in coupons if d <= calc] or [issue])
     next_coupon = min([d for d in coupons if d > calc] or [maturity])
-    # AI purely informational, not used in solving because price passed is dirty
-    ai = _accrued_interest(calc, last_coupon, next_coupon, coupon_amt)
 
-    # Secondary yield
+    # Secondary
     remain_coupons = sum(1 for d in coupons if d > calc)
     if coupon_amt == 0.0 or remain_coupons <= 1:
-        # SIM inversion
         redemption = par + (coupon_amt if coupon_amt > 0 else 0.0)
         days = (maturity - calc).days
         y_sec = (redemption / price_dirty - 1.0) * (DAY_COUNT / days)
         sec_formula = "SIM (інверсія)"
     else:
         cfs = _future_cashflows(calc, coupons, coupon_amt, par)
-        def f(y):
-            return _ytm_dirty(calc, cfs, y) - price_dirty
-        y_sec = _solve_bisect(f, 0.000001, 2.0)  # 0%..200% eff.
+        def f(y): return _ytm_dirty(calc, cfs, y) - price_dirty
+        y_sec = _solve_bisect(f, 1e-6, 2.0)  # 0..200% eff
         sec_formula = "YTM solve"
 
-    # Primary yield (MinFin)
+    # Primary (MinFin)
     if coupon_amt == 0.0:
         redemption = par
         days = (maturity - calc).days
@@ -260,10 +248,11 @@ def yields_from_price(calc_date: str, isin: str, price_dirty: float, df: pd.Data
         pri_formula = "SIM (інверсія, первинний)"
     else:
         cfs = _future_cashflows(calc, coupons, coupon_amt, par)
-        def f2(y):
-            return _minfin_dirty(calc, cfs, y) - price_dirty
-        y_pri = _solve_bisect(f2, 0.000001, 5.0)
+        def f2(y): return _minfin_dirty(calc, cfs, y) - price_dirty
+        y_pri = _solve_bisect(f2, 1e-6, 5.0)
         pri_formula = "Мінфін solve (simple discount)"
+
+    ai = _accrued_interest(calc, last_coupon, next_coupon, coupon_amt)
 
     return {
         "Currency": ccy,
@@ -277,16 +266,12 @@ def yields_from_price(calc_date: str, isin: str, price_dirty: float, df: pd.Data
 # --------------------------- Trade outcome -----------------------
 def trade_outcome(isin: str, buy_date: str, buy_yield_percent: float,
                   sell_date: str, sell_yield_percent: float, df: pd.DataFrame):
-    """
-    Розрахунок P&L: використовує **вторинний ринок** для ціноутворення (dirty).
-    """
     row = _get_bond_row(df, isin)
     ccy = row["Currency"]
 
     buy_dirty, _, _, _, _ = secondary_price_from_yield(buy_date, isin, buy_yield_percent, df)
     sell_dirty, _, _, _, _ = secondary_price_from_yield(sell_date, isin, sell_yield_percent, df)
 
-    # Купони отримані між датами (ex-date нехай співпадає з датою купону)
     sched, coupon_rate, _ = build_cashflow_schedule(df, isin, from_date=buy_date)
     sched_dt = [(pd.to_datetime(d), float(a)) for d, a in zip(sched["Дата"], sched["Сума"])]
     bdt = pd.to_datetime(buy_date).normalize()
