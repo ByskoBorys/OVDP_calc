@@ -18,10 +18,6 @@ st.title("📈 Калькулятор ОВДП")
 
 # ---------- helper: xlsx export ----------
 def _to_xlsx_bytes(sheets: dict) -> bytes:
-    """
-    sheets: {"SheetName": DataFrame або dict}
-    Повертає байти XLSX для st.download_button.
-    """
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         for name, data in sheets.items():
@@ -40,7 +36,7 @@ def _to_xlsx_bytes(sheets: dict) -> bytes:
 # ---------- load data (web or fallback) ----------
 with st.spinner("Завантажуємо дані НБУ..."):
     try:
-        df, asof_label = load_df()  # asof_label — уже «красива» строка
+        df, asof_label = load_df()
     except Exception as e:
         st.error(f"Не вдалось завантажити дані НБУ: {e}")
         st.stop()
@@ -48,7 +44,6 @@ with st.spinner("Завантажуємо дані НБУ..."):
 # ---------- sidebar: info + FAQ ----------
 st.sidebar.success(f"Дані НБУ станом на: {asof_label}")
 st.sidebar.caption("Джерело: bank.gov.ua/files/Fair_value/sec_hdbk.xls")
-
 with st.sidebar.expander("FAQ / Що вміє калькулятор?"):
     st.markdown(
         """
@@ -70,6 +65,19 @@ with st.sidebar.expander("FAQ / Що вміє калькулятор?"):
 
 # ---------- tabs ----------
 tab_calc, tab_trade = st.tabs(["Калькулятор", "Розрахувати угоду"])
+
+# ========================= helpers =========================
+def _safe_schedule(isin: str, from_date: str):
+    """Пробуем получить график купонов; если bond_utils падает — делаем мягкий фоллбек."""
+    try:
+        sched, coupon_rate, ccy = build_cashflow_schedule(df, isin, from_date=from_date)
+        return sched, coupon_rate, ccy, None
+    except Exception as e:
+        # мягкий фоллбек: пустая таблица + извлечём купон и валюту из df
+        row = df[df["ISIN"] == isin].head(1)
+        coupon_rate = float(row["Coupon_rate"].iloc[0]) if "Coupon_rate" in row.columns and not row["Coupon_rate"].isna().all() else 0.0
+        ccy = str(row["Currency"].iloc[0]) if "Currency" in row.columns and not row["Currency"].isna().all() else "UAH"
+        return pd.DataFrame(), coupon_rate, ccy, str(e)
 
 # ========================= КАЛЬКУЛЯТОР =========================
 with tab_calc:
@@ -97,44 +105,28 @@ with tab_calc:
         try:
             if input_mode == "Дохідність (%)":
                 if market == "Вторинний":
-                    dirty, ai, clean, ccy, formula = secondary_price_from_yield(
-                        str(calc_date), isin, y_val, df
-                    )
+                    dirty, ai, clean, ccy, formula = secondary_price_from_yield(str(calc_date), isin, y_val, df)
                 else:
-                    dirty, ai, clean, ccy, formula = primary_price_from_yield_minfin(
-                        str(calc_date), isin, y_val, df
-                    )
+                    dirty, ai, clean, ccy, formula = primary_price_from_yield_minfin(str(calc_date), isin, y_val, df)
 
-                sched, coupon_rate, ccy2 = build_cashflow_schedule(
-                    df, isin, from_date=str(calc_date)
-                )
-                st.success(
-                    f"**Валюта:** {ccy} • **Купон (номінальна):** {round(coupon_rate*100, 2)}%"
-                )
-                st.info(
-                    f"**Результат:** Dirty: **{dirty} {ccy}** | НКД: **{ai}** | Clean: **{clean}** | Формула: **{formula}**"
-                )
-                st.markdown("**Графік купонів та погашення (від дати розрахунку):**")
-                st.dataframe(sched, use_container_width=True)
+                sched, coupon_rate, ccy2, warn = _safe_schedule(isin, from_date=str(calc_date))
+                st.success(f"**Валюта:** {ccy} • **Купон (номінальна):** {round(coupon_rate*100, 2)}%")
+                if warn:
+                    st.warning(f"Графік купонів не вдалося побудувати: {warn}")
 
-                # XLSX export
-                xlsx_bytes = _to_xlsx_bytes(
-                    {
-                        "Inputs": pd.DataFrame(
-                            [{"ISIN": isin, "Дата": str(calc_date), "Ринок": market, "Ввід": "Y%", "Y, %": y_val}]
-                        ),
-                        "Result": pd.DataFrame(
-                            [{"Dirty": dirty, "НКД": ai, "Clean": clean, "Валюта": ccy, "Формула": formula}]
-                        ),
-                        "Schedule": sched,
-                    }
-                )
-                st.download_button(
-                    "⬇️ Завантажити XLSX",
-                    data=xlsx_bytes,
-                    file_name=f"OVDP_calc_{isin}_{calc_date}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                st.info(f"**Результат:** Dirty: **{dirty} {ccy}** | НКД: **{ai}** | Clean: **{clean}** | Формула: **{formula}**")
+                if not sched.empty:
+                    st.markdown("**Графік купонів та погашення (від дати розрахунку):**")
+                    st.dataframe(sched, use_container_width=True)
+
+                xlsx_bytes = _to_xlsx_bytes({
+                    "Inputs": pd.DataFrame([{"ISIN": isin, "Дата": str(calc_date), "Ринок": market, "Ввід": "Y%", "Y, %": y_val}]),
+                    "Result": pd.DataFrame([{"Dirty": dirty, "НКД": ai, "Clean": clean, "Валюта": ccy, "Формула": formula}]),
+                    "Schedule": sched if not sched.empty else pd.DataFrame([{"Повідомлення": warn or "Немає даних"}]),
+                })
+                st.download_button("⬇️ Завантажити XLSX", data=xlsx_bytes,
+                                   file_name=f"OVDP_calc_{isin}_{calc_date}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
             else:
                 res = yields_from_price(str(calc_date), isin, p_val, df)
@@ -143,37 +135,26 @@ with tab_calc:
                     f"**Вторинний:** {res.get('Secondary_yield')}% ({res.get('Secondary_formula')}) • "
                     f"**Первинний (Мінфін):** {res.get('Primary_yield')}% ({res.get('Primary_formula')})"
                 )
-                sched, coupon_rate, ccy = build_cashflow_schedule(
-                    df, isin, from_date=str(calc_date)
-                )
-                st.markdown(
-                    f"**Купон (номінальна):** {round(coupon_rate*100, 2)}% • **Валюта:** {ccy}"
-                )
-                st.dataframe(sched, use_container_width=True)
+                sched, coupon_rate, ccy, warn = _safe_schedule(isin, from_date=str(calc_date))
+                st.markdown(f"**Купон (номінальна):** {round(coupon_rate*100, 2)}% • **Валюта:** {ccy}")
+                if not sched.empty:
+                    st.dataframe(sched, use_container_width=True)
+                elif warn:
+                    st.warning(f"Графік купонів не вдалося побудувати: {warn}")
 
-                # XLSX export
                 res_row = {
-                    "ISIN": isin,
-                    "Дата": str(calc_date),
-                    "Валюта": res.get("Currency"),
-                    "Втор., %": res.get("Secondary_yield"),
-                    "Формула (втор.)": res.get("Secondary_formula"),
-                    "Перв. (Мінфін), %": res.get("Primary_yield"),
-                    "Формула (перв.)": res.get("Primary_formula"),
+                    "ISIN": isin, "Дата": str(calc_date), "Валюта": res.get("Currency"),
+                    "Втор., %": res.get("Secondary_yield"), "Формула (втор.)": res.get("Secondary_formula"),
+                    "Перв. (Мінфін), %": res.get("Primary_yield"), "Формула (перв.)": res.get("Primary_formula"),
                 }
-                xlsx_bytes = _to_xlsx_bytes(
-                    {
-                        "Inputs": pd.DataFrame([{"ISIN": isin, "Ввід": "Ціна (dirty)", "Ціна": p_val}]),
-                        "Result": pd.DataFrame([res_row]),
-                        "Schedule": sched,
-                    }
-                )
-                st.download_button(
-                    "⬇️ Завантажити XLSX",
-                    data=xlsx_bytes,
-                    file_name=f"OVDP_calc_{isin}_{calc_date}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
+                xlsx_bytes = _to_xlsx_bytes({
+                    "Inputs": pd.DataFrame([{"ISIN": isin, "Ввід": "Ціна (dirty)", "Ціна": p_val}]),
+                    "Result": pd.DataFrame([res_row]),
+                    "Schedule": sched if not sched.empty else pd.DataFrame([{"Повідомлення": warn or "Немає даних"}]),
+                })
+                st.download_button("⬇️ Завантажити XLSX", data=xlsx_bytes,
+                                   file_name=f"OVDP_calc_{isin}_{calc_date}.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
         except Exception as e:
             st.error(f"Помилка розрахунку: {e}")
@@ -196,49 +177,28 @@ with tab_trade:
             res = trade_outcome(isin_t, str(buy_date), buy_y, str(sell_date), sell_y, df)
 
             st.success(f"**Валюта:** {res['Currency']} • **Тримали днів:** {res['Days_held']}")
-            st.write(
-                f"**Ціна покупки (dirty):** {res['Buy']['price_dirty']} | "
-                f"**Ціна продажу (dirty):** {res['Sell']['price_dirty']}"
-            )
-            st.write(
-                f"**Отримані купони:** {res['Coupons_total']} | "
-                f"**P&L, сума:** {res['Profit_abs']} | **Річна проста %:** {res['Profit_ann_pct']}%"
-            )
+            st.write(f"**Ціна покупки (dirty):** {res['Buy']['price_dirty']} | **Ціна продажу (dirty):** {res['Sell']['price_dirty']}")
+            st.write(f"**Отримані купони:** {res['Coupons_total']} | **P&L, сума:** {res['Profit_abs']} | **Річна проста %:** {res['Profit_ann_pct']}%")
 
             if res.get("Coupons_received"):
                 st.markdown("**Купони за період володіння:**")
-                st.dataframe(
-                    pd.DataFrame(res["Coupons_received"], columns=["Дата", "Сума"]),
-                    use_container_width=True
-                )
+                st.dataframe(pd.DataFrame(res["Coupons_received"], columns=["Дата", "Сума"]), use_container_width=True)
             else:
                 st.info("За період володіння купонів не було.")
 
-            # XLSX export (trade)
             trade_sheet = pd.DataFrame([{
-                "ISIN": isin_t,
-                "Дата купівлі": str(buy_date),
-                "Y купівлі, %": buy_y,
-                "Дата продажу": str(sell_date),
-                "Y продажу, %": sell_y,
-                "Валюта": res["Currency"],
-                "Днів у позиції": res["Days_held"],
-                "Dirty (buy)": res["Buy"]["price_dirty"],
-                "Dirty (sell)": res["Sell"]["price_dirty"],
-                "Купони, всього": res["Coupons_total"],
-                "P&L, сума": res["Profit_abs"],
-                "P&L, річна проста, %": res["Profit_ann_pct"],
+                "ISIN": isin_t, "Дата купівлі": str(buy_date), "Y купівлі, %": buy_y,
+                "Дата продажу": str(sell_date), "Y продажу, %": sell_y, "Валюта": res["Currency"],
+                "Днів у позиції": res["Days_held"], "Dirty (buy)": res["Buy"]["price_dirty"],
+                "Dirty (sell)": res["Sell"]["price_dirty"], "Купони, всього": res["Coupons_total"],
+                "P&L, сума": res["Profit_abs"], "P&L, річна проста, %": res["Profit_ann_pct"],
             }])
             sheets = {"Trade": trade_sheet}
             if res.get("Coupons_received"):
-                sheets["Coupons"] = pd.DataFrame(res["Coupons_received"], columns=["Дата", "Сума"])
+                sheets["Coupons"] = pd.DataFrame(res["Coupons_received"], columns=["Дата","Сума"])
             xlsx_bytes = _to_xlsx_bytes(sheets)
-
-            st.download_button(
-                "⬇️ Завантажити XLSX (угода)",
-                data=xlsx_bytes,
-                file_name=f"OVDP_trade_{isin_t}_{buy_date}_{sell_date}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            st.download_button("⬇️ Завантажити XLSX (угода)", data=xlsx_bytes,
+                               file_name=f"OVDP_trade_{isin_t}_{buy_date}_{sell_date}.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         except Exception as e:
             st.error(f"Помилка розрахунку P&L: {e}")
