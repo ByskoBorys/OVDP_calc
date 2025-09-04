@@ -16,11 +16,27 @@ FALLBACK_PATHS = [
 
 # ----------------------- ВСПОМОГАТЕЛЬНЫЕ -----------------------
 
+def _clean_percent_series(s: pd.Series) -> pd.Series:
+    """
+    Перетворює стовпець зі значеннями на кшталт '16%', '16,00', '0.16' у десятковий вигляд:
+      16%  -> 0.16
+      16   -> 0.16 (бо >1 => ділимо на 100)
+      0.16 -> 0.16
+    """
+    if s is None:
+        return pd.Series(dtype=float)
+    s2 = s.astype(str).str.replace("%", "", regex=False).str.replace(",", ".", regex=False).str.strip()
+    s_num = pd.to_numeric(s2, errors="coerce")
+    # якщо медіана > 1 — значить це відсотки, поділимо на 100
+    if s_num.dropna().median() > 1.0:
+        s_num = s_num / 100.0
+    return s_num
+
 def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     """
     Приводим «плавающие» названия к канону, типизируем,
-    страхуемся по Par_value=1000, Coupon_per_year=2, Coupon_rate=0,
-    и ГАРАНТИРУЕМ наличие Date_Issue (если нет — оцениваем = Date_maturity - 365 дн).
+    страхуемся по Par_value=1000, Coupon_per_year=2, Coupon_rate=0 (з парсером відсотків),
+    і гарантуємо наявність Date_Issue (якщо нема — = Maturity − 365 дн).
     """
     def pick(cols, keys):
         for c in cols:
@@ -68,7 +84,7 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     if mapping:
         df = df.rename(columns=mapping)
 
-    # Минимальный набор
+    # Залишаємо ключові поля, якщо вони є
     keep = [c for c in [
         "ISIN","Par_value","Coupon_per_year","Coupon_rate","Yield_nominal",
         "Date_Issue","Date_maturity","Currency","Instrument_type"
@@ -76,16 +92,24 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     if keep:
         df = df[keep].copy()
 
-    # Типизация
-    for col in ["Par_value", "Coupon_per_year", "Coupon_rate", "Yield_nominal"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Числові
+    if "Par_value" in df.columns:
+        df["Par_value"] = pd.to_numeric(df["Par_value"], errors="coerce")
+    if "Coupon_per_year" in df.columns:
+        df["Coupon_per_year"] = pd.to_numeric(df["Coupon_per_year"], errors="coerce")
 
+    # Відсотки: robust парсинг у ДЕсятковий вигляд
+    if "Coupon_rate" in df.columns:
+        df["Coupon_rate"] = _clean_percent_series(df["Coupon_rate"])
+    if "Yield_nominal" in df.columns:
+        df["Yield_nominal"] = _clean_percent_series(df["Yield_nominal"])
+
+    # Дати
     for col in ["Date_Issue", "Date_maturity"]:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Дефолты и гарантии наличия ключевых полей
+    # Дефолти/гарантії
     if "Par_value" not in df.columns:
         df["Par_value"] = 1000
     df["Par_value"] = df["Par_value"].fillna(1000)
@@ -103,13 +127,11 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     df["Currency"] = df["Currency"].fillna("UAH")
 
     if "Date_maturity" not in df.columns:
-        # без даты погашения ничего не считаем — пусть выше обработается
         df["Date_maturity"] = pd.NaT
-
     if "Date_Issue" not in df.columns:
         df["Date_Issue"] = pd.NaT
 
-    # если Date_Issue пуст — оценим как Maturity - 365 дней (хватает для НКД/last coupon)
+    # Якщо Date_Issue пуст — оцінюємо як Maturity − 365 днів (для НКД/періоду)
     mask_issue = df["Date_Issue"].isna() & df["Date_maturity"].notna()
     df.loc[mask_issue, "Date_Issue"] = df.loc[mask_issue, "Date_maturity"] - pd.to_timedelta(365, unit="D")
 
@@ -122,7 +144,7 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
 
 def _parse_web_xls(content: bytes) -> pd.DataFrame:
     raw = io.BytesIO(content)
-    # «черновой» проход, чтобы найти строку шапки
+    # «черновой» прохід для пошуку рядка заголовків
     df_raw = pd.read_excel(raw, header=None, engine="xlrd")
     header_row = None
     for i in range(min(30, len(df_raw))):
@@ -156,22 +178,21 @@ def _read_local(path: Path) -> pd.DataFrame:
 def load_df():
     """
     Возвращает: (df, asof_label)
-    asof_label — строка для UI (дата успешной загрузки: web или локальный).
+    asof_label — строка для UI (дата успешной загрузки: web или локальний).
     """
     # 1) web
     try:
         r = requests.get(URL_XLS, timeout=30)
         r.raise_for_status()
         df = _parse_web_xls(r.content)
-        asof_label = str(pd.Timestamp.now().date())          # дата УСПЕШНОГО скачивания
-        # базовая валидация
+        asof_label = str(pd.Timestamp.now().date())  # дата успішного скачування
         if df["Date_maturity"].isna().all():
-            raise ValueError("В джерелі НБУ немає коректної дати погашення.")
+            raise ValueError("У джерелі НБУ відсутня коректна дата погашення.")
         return df, asof_label
     except Exception as e_web:
         st.warning(f"НБУ недоступен або формат змінився: {e_web}. Використовую локальний файл.", icon="⚠️")
 
-    # 2) локальные фоллбеки
+    # 2) локальні фоллбеки
     for p in FALLBACK_PATHS:
         if p.exists():
             try:
@@ -183,7 +204,6 @@ def load_df():
             except Exception as e_loc:
                 st.warning(f"Не вдалося прочитати {p.name}: {e_loc}")
 
-    # 3) вообще ничего нет
     raise FileNotFoundError(
         f"Немає жодного файлу фоллбека: {', '.join(str(p) for p in FALLBACK_PATHS)}"
     )
