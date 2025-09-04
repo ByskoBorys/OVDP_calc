@@ -6,7 +6,6 @@ DAY_COUNT = 365.0  # ACT/365
 # ----------------------------- helpers -----------------------------
 
 def _norm_pct_scalar(v) -> float:
-    """Нормалізує значення у десятковий відсоток (0.16)."""
     try:
         if v is None or (isinstance(v, float) and pd.isna(v)):
             return 0.0
@@ -27,7 +26,6 @@ def _get_bond_row(df: pd.DataFrame, isin: str) -> pd.Series:
 
     row["Par_value"] = float(row.get("Par_value", 1000) if pd.notna(row.get("Par_value", np.nan)) else 1000)
 
-    # частота купонів
     cpy = row.get("Coupon_per_year", 2)
     try:
         cpy = int(cpy) if pd.notna(cpy) else 2
@@ -35,7 +33,6 @@ def _get_bond_row(df: pd.DataFrame, isin: str) -> pd.Series:
         cpy = 2
     row["Coupon_per_year"] = max(0, cpy)
 
-    # купонна ставка (десяткова): спочатку Coupon_rate, якщо немає — беремо Yield_nominal
     coup = row.get("Coupon_rate", np.nan)
     if pd.isna(coup) or float(coup) == 0.0:
         coup = row.get("Yield_nominal", np.nan)
@@ -54,14 +51,9 @@ def _get_bond_row(df: pd.DataFrame, isin: str) -> pd.Series:
     row["Date_Issue"] = issue.normalize()
     return row
 
-# --- генерація купонних дат «кроком у днях» ---
+# ---------- генерація купонних дат: ФІКСОВАНИЙ КРОК У ДНЯХ ----------
 
 def _step_days_for_freq(freq: int) -> int:
-    """
-    Фіксуємо крок у днях для головних частот:
-      1 → 365, 2 → 182, 4 → 91, 12 → 30.
-    Для інших — округлюємо 365/freq.
-    """
     if freq <= 0:
         return 365
     preset = {1: 365, 2: 182, 4: 91, 12: 30}
@@ -69,17 +61,17 @@ def _step_days_for_freq(freq: int) -> int:
 
 def _coupon_dates_by_days(maturity: pd.Timestamp, freq: int, around_date: pd.Timestamp):
     """
-    Будуємо ряд купонних дат, відраховуючи назад від погашення фіксованим кроком у днях,
-    доки не пройдемо дату розрахунку. Повертаємо відсортований список дат.
+    Будуємо: maturity, maturity-STEP, maturity-2*STEP, ...
+    STEP = 182 дні для freq=2 (і відповідно для інших частот).
+    Генеруємо доти, доки не пройдемо around_date.
     """
     step = _step_days_for_freq(freq)
     d = maturity.normalize()
     dates = [d]
-    # рухаємось назад, поки не перейдемо дату розрахунку ще на один крок
-    while True:
+    for _ in range(120):  # safety
         d = d - pd.Timedelta(days=step)
-        dates.append(d)
-        if d <= around_date - pd.Timedelta(days=step):
+        dates.append(d.normalize())
+        if d <= around_date:
             break
     dates = sorted(set(dates))
     return dates
@@ -105,10 +97,20 @@ def _future_cashflows(calc_date: pd.Timestamp, coupon_dates: list, coupon_amt: f
         cfs.append((d, amt))
     return cfs
 
+def _last_next_coupon(calc: pd.Timestamp, coupons: list, freq: int):
+    future = [d for d in coupons if d > calc]
+    next_c = min(future) if future else coupons[-1]
+    past = [d for d in coupons if d <= calc]
+    if past:
+        last_c = max(past)
+    else:
+        last_c = next_c - pd.Timedelta(days=_step_days_for_freq(freq))
+    return last_c, next_c
+
 # --------------------------- SCHEDULE -----------------------------
 
 def build_cashflow_schedule(df: pd.DataFrame, isin: str, from_date: str):
-    """Графік від дати розрахунку: maturity, maturity−крок, ... тільки майбутні потоки."""
+    """Графік від дати розрахунку: maturity, maturity−STEP, ... лише майбутні потоки."""
     row = _get_bond_row(df, isin)
     maturity = row["Date_maturity"]
     freq = int(row["Coupon_per_year"]) or 2
@@ -144,22 +146,7 @@ def _minfin_dirty(calc: pd.Timestamp, cfs: list, y: float) -> float:
         dirty += amt / (1.0 + y * t)
     return dirty
 
-def _last_next_coupon(calc: pd.Timestamp, coupons: list, freq: int):
-    """Знаходимо купон до/після дати розрахунку, з урахуванням нашої часової сітки."""
-    step = _step_days_for_freq(freq)
-    future = sorted([d for d in coupons if d > calc])
-    next_c = future[0] if future else coupons[-1]
-    # last: або найближча <= calc, або next - step
-    past = sorted([d for d in coupons if d <= calc])
-    last_c = past[-1] if past else next_c - pd.Timedelta(days=step)
-    return last_c, next_c
-
 def secondary_price_from_yield(calc_date: str, isin: str, yield_percent: float, df: pd.DataFrame):
-    """
-    Вторинний ринок:
-      - якщо купон = 0 або залишився один платіж → SIM,
-      - інакше → YTM (ефективна ставка, дисконтуємо (1+y)^t).
-    """
     row = _get_bond_row(df, isin)
     calc = pd.to_datetime(calc_date).normalize()
     par = float(row["Par_value"])
@@ -175,7 +162,7 @@ def secondary_price_from_yield(calc_date: str, isin: str, yield_percent: float, 
     y = float(yield_percent) / 100.0
     remain = sum(1 for d in coupons if d > calc)
     if coupon_amt == 0.0 or remain <= 1:
-        dirty = _sim_price(calc, maturity, par + (coupon_amt if coupon_amt > 0 else 0.0), y)
+        dirty = _sim_price(calc, maturity, par + (coup_amt if (coup_amt := coupon_amt) > 0 else 0.0), y)
         formula = "SIM (дисконт/останній купон)"
     else:
         cfs = _future_cashflows(calc, coupons, coupon_amt, par)
@@ -187,11 +174,6 @@ def secondary_price_from_yield(calc_date: str, isin: str, yield_percent: float, 
     return round(dirty, 2), round(ai, 2), round(clean, 2), ccy, formula
 
 def primary_price_from_yield_minfin(calc_date: str, isin: str, yield_percent: float, df: pd.DataFrame):
-    """
-    Первинний ринок:
-      - дисконтні → SIM,
-      - купонні → просте дисконтування кожного потоку (Мінфін): CF / (1 + y*t).
-    """
     row = _get_bond_row(df, isin)
     calc = pd.to_datetime(calc_date).normalize()
     par = float(row["Par_value"])
@@ -253,7 +235,6 @@ def yields_from_price(calc_date: str, isin: str, price_dirty: float, df: pd.Data
     coupon_amt = _coupon_amount(par, coupon_rate, freq)
     last_c, next_c = _last_next_coupon(calc, coupons, freq)
 
-    # Secondary
     remain = sum(1 for d in coupons if d > calc)
     if coupon_amt == 0.0 or remain <= 1:
         days = (maturity - calc).days
@@ -265,7 +246,6 @@ def yields_from_price(calc_date: str, isin: str, price_dirty: float, df: pd.Data
         y_sec = _solve_bisect(f, 1e-6, 2.0)
         sec_formula = "YTM solve"
 
-    # Primary (MinFin)
     if coupon_amt == 0.0:
         days = (maturity - calc).days
         y_pri = (par / price_dirty - 1.0) * (DAY_COUNT / days)
@@ -301,13 +281,12 @@ def trade_outcome(isin: str, buy_date: str, buy_yield_percent: float,
     buy_dirty, _, _, _, _ = secondary_price_from_yield(buy_date, isin, buy_yield_percent, df)
     sell_dirty, _, _, _, _ = secondary_price_from_yield(sell_date, isin, sell_yield_percent, df)
 
-    # купони між датами володіння
-    sched_buy_side = _coupon_dates_by_days(maturity, freq, pd.to_datetime(buy_date))
+    all_dates = _coupon_dates_by_days(maturity, freq, pd.to_datetime(buy_date))
     coup_amt = _coupon_amount(par, coupon_rate, freq)
     bdt = pd.to_datetime(buy_date).normalize()
     sdt = pd.to_datetime(sell_date).normalize()
-    coupons = [(d.strftime("%Y-%m-%d"), coup_amt + (par if d == sched_buy_side[-1] else 0.0))
-               for d in sched_buy_side if bdt < d <= sdt]
+    coupons = [(d.strftime("%Y-%m-%d"), coup_amt + (par if d == all_dates[-1] else 0.0))
+               for d in all_dates if bdt < d <= sdt]
     coupons_total = sum(a for _, a in coupons)
 
     profit_abs = sell_dirty - buy_dirty + coupons_total
