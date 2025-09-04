@@ -9,7 +9,7 @@ URL_XLS = "https://bank.gov.ua/files/Fair_value/sec_hdbk.xls"
 
 # Локальні фоллбеки (в такому порядку)
 FALLBACK_PATHS = [
-    Path("data/sec.hdbk-2.xls"),        # як ти просив
+    Path("data/sec.hdbk-2.xls"),        # як просив
     Path("data/sec_hdbk_sample.xlsx"),  # запасний варіант (xlsx)
     Path("data/sec_hdbk_sample.csv"),   # ще один запасний (csv)
 ]
@@ -18,7 +18,9 @@ FALLBACK_PATHS = [
 
 def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Приводим «плавающие» названия к канону, типизируем, страхуемся по Par_value=1000.
+    Приводим «плавающие» названия к канону, типизируем,
+    страхуемся по Par_value=1000, Coupon_per_year=2, Coupon_rate=0,
+    и ГАРАНТИРУЕМ наличие Date_Issue (если нет — оцениваем = Date_maturity - 365 дн).
     """
     def pick(cols, keys):
         for c in cols:
@@ -48,7 +50,7 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     if c: mapping[c] = "Coupon_rate"
 
     # Dates
-    c = pick(cols, ["дата розміщ", "дата размещ"])
+    c = pick(cols, ["дата розміщ", "дата размещ", "issue"])
     if c: mapping[c] = "Date_Issue"
     c = pick(cols, ["дата погаш", "maturity"])
     if c: mapping[c] = "Date_maturity"
@@ -66,6 +68,7 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     if mapping:
         df = df.rename(columns=mapping)
 
+    # Минимальный набор
     keep = [c for c in [
         "ISIN","Par_value","Coupon_per_year","Coupon_rate","Yield_nominal",
         "Date_Issue","Date_maturity","Currency","Instrument_type"
@@ -73,6 +76,7 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
     if keep:
         df = df[keep].copy()
 
+    # Типизация
     for col in ["Par_value", "Coupon_per_year", "Coupon_rate", "Yield_nominal"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -81,10 +85,35 @@ def _guess_and_rename(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # якщо Par_value немає/порожній — підставляємо 1000
-    if "Par_value" not in df.columns or df["Par_value"].isna().all():
+    # Дефолты и гарантии наличия ключевых полей
+    if "Par_value" not in df.columns:
         df["Par_value"] = 1000
+    df["Par_value"] = df["Par_value"].fillna(1000)
 
+    if "Coupon_per_year" not in df.columns:
+        df["Coupon_per_year"] = 2
+    df["Coupon_per_year"] = df["Coupon_per_year"].fillna(2).clip(lower=1)
+
+    if "Coupon_rate" not in df.columns:
+        df["Coupon_rate"] = 0.0
+    df["Coupon_rate"] = df["Coupon_rate"].fillna(0.0)
+
+    if "Currency" not in df.columns:
+        df["Currency"] = "UAH"
+    df["Currency"] = df["Currency"].fillna("UAH")
+
+    if "Date_maturity" not in df.columns:
+        # без даты погашения ничего не считаем — пусть выше обработается
+        df["Date_maturity"] = pd.NaT
+
+    if "Date_Issue" not in df.columns:
+        df["Date_Issue"] = pd.NaT
+
+    # если Date_Issue пуст — оценим как Maturity - 365 дней (хватает для НКД/last coupon)
+    mask_issue = df["Date_Issue"].isna() & df["Date_maturity"].notna()
+    df.loc[mask_issue, "Date_Issue"] = df.loc[mask_issue, "Date_maturity"] - pd.to_timedelta(365, unit="D")
+
+    # Чистка
     if "ISIN" in df.columns:
         df = df[df["ISIN"].notna()].drop_duplicates(subset=["ISIN"]).reset_index(drop=True)
 
@@ -135,6 +164,9 @@ def load_df():
         r.raise_for_status()
         df = _parse_web_xls(r.content)
         asof_label = str(pd.Timestamp.now().date())          # дата УСПЕШНОГО скачивания
+        # базовая валидация
+        if df["Date_maturity"].isna().all():
+            raise ValueError("В джерелі НБУ немає коректної дати погашення.")
         return df, asof_label
     except Exception as e_web:
         st.warning(f"НБУ недоступен або формат змінився: {e_web}. Використовую локальний файл.", icon="⚠️")
@@ -144,6 +176,8 @@ def load_df():
         if p.exists():
             try:
                 df = _read_local(p)
+                if df["Date_maturity"].isna().all():
+                    raise ValueError("У фоллбек-файлі немає коректної дати погашення.")
                 asof_label = f"локальний файл • {pd.Timestamp.now().date()}"
                 return df, asof_label
             except Exception as e_loc:
