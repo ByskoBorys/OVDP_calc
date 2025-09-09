@@ -1,4 +1,3 @@
-# bond_utils.py
 import pandas as pd
 import numpy as np
 
@@ -69,7 +68,7 @@ def _coupon_dates_182_from_maturity(maturity: pd.Timestamp, until_date: pd.Times
     return asc
 
 def _semi_coupon_amount(par: float, coupon_rate: float, k: int) -> float:
-    """Розмір купона на один період. Для нашої сітки (182) очікуємо k=2."""
+    """Купон за один період. Для нашої сітки очікуємо k=2."""
     if coupon_rate <= 0 or k <= 0:
         return 0.0
     return par * coupon_rate / float(k)
@@ -85,7 +84,6 @@ def accrued_interest(calc_date, isin, df) -> float:
 
     calc = pd.to_datetime(calc_date).normalize()
     dates = _coupon_dates_182_from_maturity(row["Date_maturity"], calc)
-    # знайти next/prev
     future = [d for d in dates if d > calc]
     next_c = future[0] if future else dates[-1]
     idx_next = dates.index(next_c)
@@ -138,16 +136,16 @@ def _full_coupon_schedule_and_params(df, isin):
     """
     row = _get_bond_row(df, isin)
     par, ccy, y_coup, k, maturity = float(row["Par_value"]), row["Currency"], float(row["Coupon_rate"]), int(row["Coupon_per_year"]), row["Date_maturity"]
-    # для узгодженості — генеруємо дати до «сьогодні» (ми все одно відфільтруємо за calc_date)
     dates = _coupon_dates_182_from_maturity(maturity, pd.Timestamp("1900-01-01"))
     return dates, par, ccy, y_coup, k, maturity
 
 def calculate_price_minfin(calc_date, isin, yield_percent, df):
     """
-    Єдиний вхід (з твого еталону):
-      • купонні → Мінфін із показником: DF = (1 + y/k) ** (Days / KDP0)
-      • дисконтні → SIM: Price = Nom / (1 + y * Days/365)
-    Вихід: dirty, AI, clean, currency
+    Купонні → Мінфін із показником:
+      DF = (1 + y/k) ** (Days / KDP0), де KDP0 — довжина ПОТОЧНОГО періоду.
+    Дисконтні → SIM.
+
+    Повертає: dirty, AI, clean, ccy
     """
     calc_date = pd.to_datetime(calc_date).normalize()
     dates, par, ccy, coupon_rate, k, maturity = _full_coupon_schedule_and_params(df, isin)
@@ -237,13 +235,11 @@ def primary_yield_from_price_minfin(calc_date: str, isin: str, price_dirty: floa
     dates, par, ccy, coupon_rate, k, maturity = _full_coupon_schedule_and_params(df, isin)
 
     if coupon_rate <= 0 or k <= 0:
-        # SIM інверсія
         days = (maturity - calc).days
         t = max(0.0, days / DAY_COUNT)
         y = (par / price_dirty - 1.0) / t if t > 0 else 0.0
         return {"Currency": ccy, "Yield_percent": round(y * 100.0, 2), "Formula": "SIM (інверсія, дисконт)"}
 
-    # Підготовка next/prev для KDP0 (як у прямому)
     future = [d for d in dates if d >= calc]
     if not future:
         return {"Currency": ccy, "Yield_percent": 0.0, "Formula": "Мінфін (інверсія) — немає потоків"}
@@ -303,18 +299,14 @@ def secondary_price_from_yield(calc_date: str, isin: str, yield_percent: float, 
     dates = _coupon_dates_182_from_maturity(maturity, calc)
     sd = _semi_coupon_amount(par, y_coup, k)
 
-    # AI (незалежно від двигуна)
-    # (ми вже маємо функцію accrued_interest)
     ai = accrued_interest(calc, isin, df)
-
     y = float(yield_percent) / 100.0
-    # скільки платежів залишилось?
+
     remain = sum(1 for d in dates if d > calc)
     if sd == 0.0 or remain <= 1:
         dirty = _sim_price(calc, maturity, par + (sd if sd > 0 else 0.0), y)
         formula = "SIM (дисконт/останній купон)"
     else:
-        # CF окремо: купони + номінал у кінці
         cfs = []
         for d in dates:
             if d <= calc:
@@ -350,7 +342,6 @@ def secondary_yield_from_price(calc_date: str, isin: str, price_dirty: float, df
         y = ((par + (sd if sd > 0 else 0.0)) / price_dirty - 1.0) / t if t > 0 else 0.0
         return {"Currency": row["Currency"], "Yield_percent": round(y * 100.0, 2), "Formula": "SIM (інверсія)"}
     else:
-        # CF для YTM
         cfs = []
         for d in dates:
             if d <= calc:
@@ -365,3 +356,47 @@ def secondary_yield_from_price(calc_date: str, isin: str, price_dirty: float, df
             return sum(amt/((1+y)**(((d-calc).days)/DAY_COUNT)) for d, amt in cfs) - price_dirty
         y = _solve_bisect(f, 1e-10, 2.0)
         return {"Currency": row["Currency"], "Yield_percent": round(y * 100.0, 2), "Formula": "YTM solve"}
+
+# ============================ P&L угоди ============================
+
+def trade_outcome(isin: str, buy_date: str, buy_yield_percent: float,
+                  sell_date: str, sell_yield_percent: float, df: pd.DataFrame):
+    row = _get_bond_row(df, isin)
+    ccy = row["Currency"]
+    maturity = row["Date_maturity"]
+    par, y_coup, k = float(row["Par_value"]), float(row["Coupon_rate"]), int(row["Coupon_per_year"])
+    sd = _semi_coupon_amount(par, y_coup, k)
+
+    bdt = pd.to_datetime(buy_date).normalize()
+    sdt = pd.to_datetime(sell_date).normalize()
+
+    buy_dirty, _, _, _, _ = secondary_price_from_yield(buy_date, isin, buy_yield_percent, df)
+    sell_dirty, _, _, _, _ = secondary_price_from_yield(sell_date, isin, sell_yield_percent, df)
+
+    # Купони між датами володіння (сітка 182)
+    all_dates = _coupon_dates_182_from_maturity(maturity, bdt)
+    coupons = []
+    for d in all_dates:
+        if bdt < d <= sdt:
+            amt = sd + (par if d == all_dates[-1] else 0.0)
+            if sd > 0:
+                coupons.append((d.strftime("%Y-%m-%d"), sd))
+            if d == all_dates[-1]:
+                coupons.append((d.strftime("%Y-%m-%d"), par))
+    coupons_total = round(sum(a for _, a in coupons), 2)
+
+    profit_abs = round(sell_dirty - buy_dirty + coupons_total, 2)
+    days_held = (sdt - bdt).days
+    profit_ann_pct = round((profit_abs / buy_dirty) * (DAY_COUNT / days_held) * 100.0, 2) if days_held > 0 else None
+
+    return {
+        "ISIN": isin,
+        "Currency": ccy,
+        "Buy": {"date": str(bdt.date()), "yield_percent": float(buy_yield_percent), "price_dirty": round(buy_dirty, 2)},
+        "Sell": {"date": str(sdt.date()), "yield_percent": float(sell_yield_percent), "price_dirty": round(sell_dirty, 2)},
+        "Coupons_received": coupons,
+        "Coupons_total": coupons_total,
+        "Profit_abs": profit_abs,
+        "Profit_ann_pct": profit_ann_pct,
+        "Days_held": days_held
+    }
