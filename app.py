@@ -59,11 +59,9 @@ def _xlsx_one_sheet(sections: list[tuple[str, pd.DataFrame]]) -> bytes:
         sheet = "OVDP"
         start = 0
         for title, dfsec in sections:
-            # заголовок
             tdf = pd.DataFrame([[title]], columns=[" "])
             tdf.to_excel(w, sheet_name=sheet, index=False, header=False, startrow=start)
             start += 1
-            # дані
             if dfsec is not None and not dfsec.empty:
                 dfsec.to_excel(w, sheet_name=sheet, index=False, startrow=start)
                 start += len(dfsec) + 2
@@ -164,14 +162,34 @@ with tab_calc:
 with tab_trade:
     st.subheader("P&L угоди (купив → продав)")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        isin_t = st.selectbox("ISIN для угоди", sorted(df["ISIN"].dropna().unique()))
-        buy_date = st.date_input("Дата покупки", value=date.today())
-        buy_y_txt = st.text_input("Дохідність покупки, % (вторинний)", value="10,00")
-    with c2:
-        sell_date = st.date_input("Дата продажу", value=date.today())
-        sell_y_txt = st.text_input("Дохідність продажу, % (вторинний)", value="9,50")
+    # 1) ISIN — з виділенням бейджем
+    isin_t = st.selectbox("ISIN для угоди", sorted(df["ISIN"].dropna().unique()))
+    st.markdown(
+        """
+        <style>
+        .isin-badge {
+            display:inline-block; padding:8px 14px; border-radius:999px;
+            font-weight:700; background:#1f6feb; color:#fff; margin-top:6px; margin-bottom:10px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    st.markdown(f"<span class='isin-badge'>ISIN: {isin_t}</span>", unsafe_allow_html=True)
+
+    st.divider()
+
+    # 2) Купівля та Продаж — на одному рівні
+    col_buy, col_sell = st.columns(2)
+    with col_buy:
+        st.markdown("### Купівля")
+        buy_date = st.date_input("Дата покупки", value=date.today(), key="buy_date")
+        buy_y_txt = st.text_input("Дохідність покупки, % (вторинний)", value="10,00", key="buy_y_txt")
+
+    with col_sell:
+        st.markdown("### Продаж")
+        sell_date = st.date_input("Дата продажу", value=date.today(), key="sell_date")
+        sell_y_txt = st.text_input("Дохідність продажу, % (вторинний)", value="9,50", key="sell_y_txt")
 
     if st.button("Порахувати P&L", type="primary"):
         try:
@@ -202,7 +220,6 @@ with tab_trade:
                 "P&L, сума": res["Profit_abs"], "P&L, річна проста, %": res["Profit_ann_pct"],
             }])
 
-            # Один аркуш XLSX
             xlsx = _xlsx_one_sheet([
                 ("Trade", trade_df),
                 ("Coupons in holding period", pd.DataFrame(res["Coupons_received"], columns=["Дата","Сума"]) if res.get("Coupons_received") else pd.DataFrame()),
