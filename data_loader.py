@@ -7,7 +7,7 @@ import requests
 import streamlit as st
 
 # Источник НБУ
-URL_XLS = "https://bank.gov.ua/files/Fair_value/sec_hdbk.xlsx"
+URL_XLS = "https://bank.gov.ua/files/Fair_value/sec_hdbk.xls"
 
 # Фоллбеки (в таком порядке)
 FALLBACKS = [
