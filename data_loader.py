@@ -7,11 +7,11 @@ import requests
 import streamlit as st
 
 # Источник НБУ
-URL_XLS = "https://bank.gov.ua/files/Fair_value/sec_hdbk.xls"
+URL_XLSX = "https://bank.gov.ua/files/Fair_value/sec_hdbk.xlsx"
 
 # Фоллбеки (в таком порядке)
 FALLBACKS = [
-    Path("data/sec.hdbk-2.xls"),        # как просил
+    Path("data/sec.hdbk-2.xlsx"),        # как просил
     Path("data/sec_hdbk_sample.xlsx"),
     Path("data/sec_hdbk_sample.csv"),
 ]
@@ -110,7 +110,7 @@ def _parse_like_spec(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, str]:
 
 def _read_xls_bytes(content: bytes) -> tuple[pd.DataFrame, str]:
     raw = io.BytesIO(content)
-    df_raw = pd.read_excel(raw, header=None, engine="xlrd")
+    df_raw = pd.read_excel(raw, header=None, engine="openpyxl")
     return _parse_like_spec(df_raw)
 
 def _read_local_any(path: Path) -> tuple[pd.DataFrame, str]:
@@ -136,9 +136,9 @@ def load_df():
     asof_label — дата актуальности из A2+B2 (если не удалось — дата успешной загрузки).
     """
     try:
-        r = requests.get(URL_XLS, timeout=30)
+        r = requests.get(URL_XLSX, timeout=30)
         r.raise_for_status()
-        df, asof = _read_xls_bytes(r.content)
+        df, asof = _read_xlsx_bytes(r.content)
         if not asof or "не удалось" in asof.lower():
             asof = str(pd.Timestamp.now().date())
         if df["Date_maturity"].isna().all():
