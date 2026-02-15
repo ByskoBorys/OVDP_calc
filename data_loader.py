@@ -108,7 +108,7 @@ def _parse_like_spec(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, str]:
 
     return df, asof
 
-def _read_xls_bytes(content: bytes) -> tuple[pd.DataFrame, str]:
+def _read_xlsx_bytes(content: bytes) -> tuple[pd.DataFrame, str]:
     raw = io.BytesIO(content)
     df_raw = pd.read_excel(raw, header=None, engine="openpyxl")
     return _parse_like_spec(df_raw)
